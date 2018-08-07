@@ -2,6 +2,10 @@
 
 export(addMinMaxCols)
 export(cleanPlayerData)
+export(extractBpsData)
+export(playerLookup)
 export(pullFplHistoryDt)
 export(pullFplSeasonJson)
+import(data.table)
 importFrom(jsonlite,fromJSON)
+importFrom(stringi,stri_trans_general)

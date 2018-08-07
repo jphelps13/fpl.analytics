@@ -1,3 +1,6 @@
+#' @import data.table
+
+
 #' @title FUNCTION_TITLE
 #' @description FUNCTION_DESCRIPTION
 #' @param dt PARAM_DESCRIPTION
@@ -57,4 +60,71 @@ addMinMaxCols <- function(dt, num_cols){
     (x-min(x))/(max(x)-min(x))
   }), .SDcols = num_cols]
   return(dt)
+}
+
+#' @title FUNCTION_TITLE
+#' @description FUNCTION_DESCRIPTION
+#' @param fpl_season_json PARAM_DESCRIPTION
+#' @return OUTPUT_DESCRIPTION
+#' @details DETAILS
+#' @examples 
+#' \dontrun{
+#' if(interactive()){
+#'  #EXAMPLE1
+#'  }
+#' }
+#' @seealso 
+#'  \code{\link[stringi]{stri_trans_general}}
+#' @rdname playerLookup
+#' @export 
+#' @importFrom stringi stri_trans_general
+playerLookup <- function(fpl_season_json){
+  
+  # extract lookup from the json
+  lookup <- as.data.table(fpl_season_json$elements)
+  lookup[, player_name := sprintf("%s %s", first_name, second_name)]
+  lookup[, player_name := stringi::stri_trans_general(player_name, "Latin-ASCII")]
+  keep_cols <- c("id", "player_name", "team", "element_type")
+  lookup <- lookup[, keep_cols, with = FALSE]
+  setnames(lookup, "team", "team_id")
+  setnames(lookup, "id", "player_key")
+  
+  # merge to get team name
+  team_lookup <- as.data.table(fpl_season_json$teams)[, .(team_id = id, team = name)]
+  lookup <- merge(lookup, team_lookup, by = "team_id")
+  
+  # merge to get position
+  pos_lookup <- as.data.table(fpl_season_json$element_types)[, .(element_type = id, 
+                                                                 position = singular_name_short)]
+  lookup <- merge(lookup, pos_lookup, by = "element_type")
+  
+  # tidy 
+  lookup[, c("team_id", "element_type") := NULL]
+
+  return(lookup)
+}
+
+#' @title FUNCTION_TITLE
+#' @description FUNCTION_DESCRIPTION
+#' @param fpl_player_hist PARAM_DESCRIPTION
+#' @param fpl_season_json PARAM_DESCRIPTION
+#' @return OUTPUT_DESCRIPTION
+#' @details DETAILS
+#' @examples 
+#' \dontrun{
+#' if(interactive()){
+#'  #EXAMPLE1
+#'  }
+#' }
+#' @rdname extractBpsData
+#' @export 
+extractBpsData <- function(fpl_player_hist, fpl_season_json){
+  
+  player_dt <- playerLookup(fpl_season_json)
+  output <- merge(fpl_player_hist, player_dt, by = "player_key")
+
+  # trim
+  output[, c("id", "season", "element_code") := NULL]
+  
+  return(output)
 }

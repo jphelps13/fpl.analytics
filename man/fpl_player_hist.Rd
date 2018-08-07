@@ -4,7 +4,7 @@
 \name{fpl_player_hist}
 \alias{fpl_player_hist}
 \title{Player historical FTP data}
-\format{An object of class \code{character} of length 1.}
+\format{An object of class \code{data.table} (inherits from \code{data.frame}) with 1696 rows and 26 columns.}
 \source{
 \url{https://fantasy.premierleague.com/drf/element-summary}
 }

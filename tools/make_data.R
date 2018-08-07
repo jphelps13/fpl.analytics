@@ -1,5 +1,8 @@
 # script for generating the data in the /data folder
 
+remove.packages("fpl.analytics")
+devtools::install_github("jphelps13/fpl.analytics")
+
 library(fpl.analytics)
 library(devtools)
 
