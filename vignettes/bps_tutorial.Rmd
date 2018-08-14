@@ -4,37 +4,30 @@ author: "Jonathan Phelps"
 date: "6 August 2018"
 output:
  prettydoc::html_pretty:
+  keep_md: true
   toc: true
+  toc_depth: 4
   theme: cayman
   highlight: vignette
+editor_options:
+  chunk_output_type: console
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, fig.width = 12, fig.height = 8)
+knitr::opts_chunk$set(echo = TRUE, fig.width = 12, fig.height = 7)
 knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
 ```
 
 ## Overview
 
-In this post, I am going to look at predicting the number of bonus points that a player will accrue throughout the 2017 FPL season. In each Fixture, bonus points of (3,2,1) are given out to the best 3 performing players. It is rule based with the current version found at <https://www.premierleague.com/news/106533>.
+In this post, I am going to look at predicting the number of bonus points that a player will accrue throughout the 2017/18 FPL season. During a fixture, a footballer will receive `bps` points for events e.g. scoring a goal or making an interception. The scoring system for these points can be found at: <https://www.premierleague.com/news/106533>. At the end of the fixture the three players with the highest `bps` values score `bonus` points of (3, 2, 1) respectively, which are added to their total score. I'm going to have a look at the distributions of `bps` scores by position and teams, to get predictions for `bonus` points.
 
-From the FPL website I can only find information about existing players and their
-history. Some challenges I face:
-
-* Can only see a player's current team e.g. Xherdan Shaqiri will be presented 
-as a Liverpool player in the 2017/18 data, despite playing for Stoke
-* By not having old FPL players, each previous season will have less valuable 
-information as we have less players available
-* Don't have in depth fixture data, which makes inference more challenging
-* Bonus points system is position dependent, so any model would need to 
-account for this. Unfortunately not all the metrics that make up the bonus
-points is available in the data. Will need to make some assumptions about the
-underlying distribution of bonus points.
+Data was extracted and cleaned from the repository <https://github.com/vaastav/Fantasy-Premier-League> for the 2017/18 season.
 
 ## Data Exploration
 
 ### Setup
-Data is stored in my Github repo `fpl-analytics`. This can be installed below
+Data is stored in my GitHub repository `fpl-analytics`. This is stored as a package and can be installed below.
 
 ```{r message=FALSE, warning=FALSE, eval = FALSE}
 library(devtools)
@@ -42,200 +35,466 @@ install_github("jphelps13/fpl.analytics")
 ```
 
 For this tutorial please make sure you have installed the following packages.
-I will be using `data.table` for managing the data.
+I will be using the `data.table` package extensibvely.
 
 ```{r, message=FALSE, warning=FALSE}
 # Github
 library(fpl.analytics)
 
 # CRAN
-library(DT) # html tables
 library(data.table) # data management
-library(MASS) # negative binomial glm
 library(ggplot2) # plotting tool
+library(ggrepel) # plotting tool
 library(stringi) # removing special characters from names
-library(pscl) # zero inflated glms
-library(rvest) # pluck
-library(psych) # headTails
+library(HH) # glm prediction intervals
 ```
 
-### Get Data
-Some manipulation is required from the stored raw data to get a view of 
-all previous seasons for existing players. Function to create is stored in the 
-github package.
+### Data collection
+Some manipulation is required from the raw data to get a view of the players fixture data for the 2017-18 season. A view of the complete data set is below. 
 
 ```{r, warnings = FALSE}
 # collects the data from fpl.analytics for the vignette
 # special characters in player names have been translated to english for ease of use
-dt <- extractBpsData(fpl_player_hist, fpl_season_json) 
-head(dt, 3)
+# with the stringi package
+dt <- fpl.analytics::fpl_2017_18_player_history
+head(dt, 2)
 
-# Some seasons don't have any "bps" data, so I will remove this and inactive rows
+# trim fixtures where no playing time or bps values
 dt <- dt[bps > 0,]
-dt <- dt[minutes > 90] # at least one game
-# remove newly promoted teams
-check_time <- dt[, .(minutes = sum(minutes)), keyby = team]
-print(check_time[minutes < 11*90*38, team])
-check_time <- check_time[minutes > 11*90*38,]
-dt <- dt[team %in% check_time$team,]
-
-# Currently working with minutes, going to change this to number of games, and make
-# some standardised variables
-dt[, num_matches := minutes/90]
-dt[, bps_match := bps/num_matches]
-dt[, start_cost := start_cost/10] # price reported as 10* game value
-dt[, end_cost := end_cost/10]
-
-# check by season - can see that 2013/14 is an anomaly, and so, remove
-qu <- quantile(dt$bps_match, 0.995)
-ggplot() + geom_density(data=dt, aes(x=bps_match, group=season_name, fill=season_name),
-               alpha=0.5, adjust=2) + theme_minimal() + scale_x_continuous(0, qu)
-dt <- dt[season_name != "2013/14",]
-
-# check by position - the distribution for Goalkeepers is much tighter than
-# that for the others. The variance for Forwards is the greatest 
-ggplot() + geom_density(data=dt, aes(x=bps_match, group=position, fill=position),
-               alpha=0.5, adjust=2) + theme_minimal() + scale_x_continuous(0, qu)
+dt <- dt[minutes > 0,] 
 ```
+Most of this data isn't going to be used for this analysis. Key columns are:
 
+* `player_name:` name of footballer, with first name and surname separated with an underscore
+* `team/opponent_team:` team in which the footballer plays for, and against for the fixture
+* `bps:` number of hidden bonus points the footballer received in a given fixture, based on the bps rules
+* `bonus:` the end result bonus score of (1, 2, 3) based on how the footballer performed against the other players (bps)
+* `position:` position on the pitch: (GKP, DEF, MID, FWD)
+* `was_home:` whether it is a home match for that footballer
 
-### Poisson assumptions
-For count data, a Poisson distribution is usually appropriate. The challenge
-we have is that we don't have individual `bps` results for each game, which
-means we can't see the underlying distribution of the data. The sum of independent
-poisson distributions is also Poisson [(source)](https://proofwiki.org/wiki/Sum_of_Independent_Poisson_Random_Variables_is_Poisson), with equal mean and variance. 
+The objective is to predict `bonus` from `bps` plus other variables.
 
-Some other models/variations that may be appropriate:
-* Negative binomial regression - if data is overdispersed ie Variance is greater than 
-the mean, then this distribution is more suitable. [more information](https://stats.idre.ucla.edu/r/dae/negative-binomial-regression/)
-* Zero-inflation model - As bonus points are only given to 3 players per match, and the rule base system is weighted in favour of certain events e.g. scoring a goal or saving a penalty, we could expect a class of players to be less likely to get any points.
-
-```{r, fig.height = 5, fig.width = 8}
-# check mean & variance, within position
-check_poisson <- dt[, .(mu = mean(bps_match), var = var(bps_match)),
-                    by = position]
-check_poisson[]
-
-# check zero's in the final bonus metric. There are quite a lot
-check_zeros <- dt[, .N, keyby = bonus]
-ggplot(check_zeros, aes(x = bonus, y = N))+ geom_line() + theme_minimal()
-```
-
-### Variables of interest
-
-
+### Data Visualisation
+Lets have a look at the distribution of `bps` by position. As we go down the pitch, from Goalkeeper to Forward, we see that the Median `bps` value decreases, whilst the upper tail of the distribution increases.
 ```{r}
-# look at overall bps v final bonus score. Can see that its a lot more linear
-# for Forwards, than for other players e.g. goalkeepers.
-ggplot(dt, aes(x = bps, y = bonus, size = num_matches)) + facet_wrap(~position) + geom_point() +
-   scale_size_continuous(range = c(0,2)) + theme_minimal()
+# upper bound for bps, will use for plots
+qu <- quantile(dt$bps, 0.995)
 
-ggplot(dt, aes(x = bps, y = log(bonus), size = num_matches)) + facet_wrap(~position) + geom_point() +
-   scale_size_continuous(range = c(0,2)) + theme_minimal()
-
+# check bps by position 
+# - Forwards distribution looks bi-modal, with either a low score, or a score ~ 30.
+#   Variance is the largest with the longest tail. 
+# - Goalkeepers have the highest median, but the shortest tail.  
+ggplot() + geom_density(data = dt, aes(x = bps, group = position, fill = position),
+               alpha = 0.4, colour = NA, adjust = 1.5) + 
+  theme_minimal() + 
+  coord_cartesian(xlim = c(0, qu))
 ```
 
-```{r, dpi = 300, warning = FALSE}
-# visualise distributions of bps_match by position and team. 
-ggplot() + geom_density(data=dt, aes(x=bps_match, group=position, fill=position),
-               alpha=0.5, adjust=2) + theme_minimal() + facet_wrap(~team) + 
-  coord_cartesian(xlim = c(0, qu), ylim = c(0, 0.25))
-```
 
-We can see some interesting differences in the average bps per match for some
-of the teams above. E.g. Man City and Spurs (Tottenham Hotspurs) have Forwards
-that get a lot more of their teams share of bonus points, whils they have done
-poorly at Everton, Huddersfield and Watford. 
-
-```{r, dpi = 300, warning = FALSE}
+Across the season, we can visualise the distribution of the final `bonus` points. I've summed these up by players. 
+```{r, warning = FALSE}
+sum_dt <- dt[, .(bonus = sum(bonus)), by = .(player_name, team, position)]
 
 # visualise distributions of final bonus points by position and team. 
-ggplot() + geom_density(data=dt, aes(x=bonus, group=position, fill=position),
-                        alpha=0.5, adjust=2) + theme_minimal() + facet_wrap(~team) + 
-  coord_cartesian(ylim = c(0, 0.125))
-
+ggplot() + geom_density(data = sum_dt[bonus > 0,], aes(x = bonus, group = position, fill = position),
+                        alpha = 0.4, colour = NA, adjust = 1.5) + 
+  theme_minimal() +
+  coord_cartesian(ylim = c(0, 0.1))
 ```
-When we look at the final bonus 
-points though, it doesn't always correlate. The key strikers at the clubs tend
-to get more bonus points, as can be seen by the green right tails. For Man Utd,
-Defenders receive slightly more bps than players in other positions, but in terms
-of bonus points, Midfielders and Strikers receive more. Looking at the bps scoring
-system, the highest two valued are "Forwards scoring a goal" & "Midfielders" 
-scoring a goal at 24 & 18 respectively. Distribution of goals per match are below, 
-scaled and weighted. We would expect that when a Forward scores, the likelihood of
-receiving bonus points goes up a lot, compared to matches where they don't score.
+Here we see that the heavy right tail for Forwards with regards to `bps` mean they tend to score higher
+with final bonus points. The distributions for Midfielders and Defenders are 
+very similar, despite Defenders receiving more `bps` on average. This is to be
+expected as we are interested in players receiving the most `bps` points each
+fixture, not the average.
 
+We can have a look at the `bps` positional split by team:
+```{r, dpi = 300, warning = FALSE, fig.height = 12}
+# visualise distributions of bps_match by position and team. 
+ggplot() + geom_density(data = dt, aes(x = bps, group = position, fill = position),
+               alpha = 0.3, adjust = 1.5, colour = NA) + 
+  theme_minimal() + 
+  facet_wrap(~team, ncol = 4) + 
+  coord_cartesian(xlim = c(0, qu), ylim = c(0, 0.05))
+```
+
+The distribution that differs the most is that for Forwards. The established top 6 teams 
+in 2017-18 were (Man City, Man Utd, Spurs, Liverpool, Chelsea, Arsenal). In
+all these cases, the distribution of bps is quite long and flat. Compared to the three
+relegated teams (Stoke, Swansea, West Brom), there are much larker peaks close 
+to 0. 
+
+For Goalkeepers, can see that those at Stoke, Burnley and West Ham do better 
+than in other positions.
+
+Looking at the bps scoring system, the highest two valued are "Forwards scoring 
+a goal" & "Midfielders" scoring a goal at 24 & 18 respectively. 
+Distribution of goals per match are below, scaled and weighted. 
+We would expect that when a Forward scores, the likelihood of
+receiving bonus points goes up a lot, compared to matches where they don't score.
+Assists are worth 9 points, whilst clean sheets for GKP & DEF are worth 12.
 
 ```{r, dpi = 300, warning = FALSE}
-dt[, goals_matches := goals_scored/num_matches]
+sum_dt <- dt[, .(goals_scored = sum(goals_scored),
+                 assists = sum(assists),
+                 clean_sheets = sum(clean_sheets),
+                game_time = sum(minutes)/90), by = .(player_name, position, team)]
+sum_dt[, goals_match := goals_scored/game_time]
+sum_dt[, assists_match := assists/game_time]
+sum_dt[, clean_sheets_match := clean_sheets/game_time]
 
-ggplot() + geom_density(data=dt[position != "GKP",], 
-                        aes(x=goals_matches, fill = position, colour = position,
-                            weight = num_matches, y = ..scaled..),
-                        alpha=0.5, adjust=2) + theme_minimal() + facet_wrap(~position)
+# goals density, per match
+ggplot() + geom_density(data = sum_dt[position != "GKP",], 
+                        aes(x = goals_match, fill = position, weight = game_time, y = ..scaled..),
+                        alpha = 0.3, colour = NA) + 
+  theme_minimal() + 
+  coord_cartesian(xlim = c(0, 1))
+
+# assists density, per match
+ggplot() + geom_density(data = sum_dt[position != "GKP",], 
+                        aes(x = assists_match, fill = position, weight = game_time, y = ..scaled..),
+                        alpha = 0.3, colour = NA) + 
+  theme_minimal() + 
+  coord_cartesian(xlim = c(0, 1))
+
+# clean sheets density, per match
+ggplot() + geom_density(data = sum_dt[!position %in% c("MID", "FWD"),], 
+                        aes(x = clean_sheets_match, weight = game_time), fill = "darkgrey", col = NA) + 
+  theme_minimal() + 
+  coord_cartesian(xlim = c(0, 1))
 ```
+
 
 ## Modelling
 
-We don't have all the teams, fixture and bonus point data e.g. we are missing variables like pass completion rates and defensive contributions. If we did, we could try simulating the matches, using Poisson distributions for each event e.g goal, assist. For teams like Man City, they have a lot of high scoring players, so the threshold of bps
-required to receive any bonus points is higher than e.g. for Huddersfield. We could assume that the bps follow their own distribution, but we know the variance for Forwards is much higher than that for Goalkeepers. 
+### Objective
+To predict final match day `bonus` points.
 
 A complete model would consider:
 * Fixtures & Home/Away effect e.g.quality of play in different circumstances
 * Quality of the team e.g. threshold required for receiving bonus points
 * Style of play e.g. Defensive or attacking; Formation
 * Exposure i.e. amount of game time per match; number of starts
-* Position. bps point system is positional dependent
+* Position. bps point system is positional dependent. Correlation of bps between position
 * Transfers, team roster, injuries etc. understanding when a player has low exposure
 
-With the data at hand, I think anything complicated is not appropriate. I've
-tried some basic Poisson glm's with linear and non-linear effects for bps on
-bonus, by position, and the results aren't too bad. 
+Here is a view of the jittered bps v bonus across all players:
 
 ```{r}
-# - not using an offset, as the relationship between bonus and bps isn't strictly
-#   linear and has an interaction with position
-# - can see in plots above, that there is a stronger linear effect for Forwards,
-#   whilst more non-linear for the other positions. The log(bps) variable will 
-#   capture the linear part.
-m_pois <- glm(bonus ~ log(bps):position + bps:position, 
-              data = dt, 
-              family = poisson(link = "log"))
-
-# glm summary
-summary(m_pois)
-# predict
-dt$fit_pois <- round(predict(m_pois, type = "response"), 2)
-dt$res_pois <- round(dt$bonus - dt$fit_pois, 2)
-
-# visualise bps v bonus, with fit in black
-ggplot(dt, aes(x = bps, y = bonus)) + facet_wrap(~position, scales = "free_y") + 
-  geom_point(col = "darkgrey") +
-  scale_size_continuous(range = c(0,2)) + theme_minimal() +
-  geom_line(aes(x = bps, y = fit_pois))
-
-# visualise bonus vs fit, with perfect fit line added in
-ggplot(dt, aes(x = bonus, y = fit_pois)) + facet_wrap(~position, scales = "free") + 
-  geom_point(col = "darkgrey") +
-  scale_size_continuous(range = c(0,2)) + theme_minimal() + 
-  geom_abline(intercept = 0, slope = 1)
-
+ggplot(dt, aes(x = bps, y = bonus)) +
+  theme_minimal() + 
+  geom_jitter(width = 0.5, height= 0.2, col = "darkgrey")
 ```
 
-As expected, there are some issues with the fit:
+This could be converted so that the response is a (0,1) fraction e.g. below.
+If this were a binomial problem i.e. bonus points are either 0 or 1, we could
+use logistic regression with binary response. For cases such as these, logistic regression is still possible when we use a quasi-likelihood distribution. This allows for the added variance
+in the response we have by having multiple levels of bonus points.
+```{r}
+# max bonus is 3
+dt[, bonus_frac := bonus/3]
+```
 
-* Assumes each observation is iid
-* Doesn't take in to account the number of matches played
+### Logistic regression
 
-Below, we can analyse the residuals
+#### bps
+To make the displays a bit nicer, I'm going to make an assumption that there
+is a minimum `bps` threshold required in order to get bonus points. In last years
+data, there wasn't a bonus point gained for cases where `bps <= 17`.
+I've taken these out, and will assume that their fit is 0. It doesn't affect the 
+analysis too much, and allows me to focus the graphs better.
 
 ```{r}
+# assume that 18 required in order to get a bonus point
+min(dt[bonus > 0, bps])
+ql <- min(dt[bonus > 0, bps]) - 1
+mdt <- dt[bps > ql,]
 
-check_dt <- dt[order(-res_pois), 
-                .(season_name, team, position, player_name, 
-                  num_matches, bps, bps_match, bonus, fit_pois, res_pois)]
-check_dt[, num_matches := round(num_matches, 1)]
-check_dt[, bps_match := round(bps_match, 1)]
+# fit base model against bps
+mod0 <- glm(bonus_frac ~ bps, data = mdt, family = quasibinomial("logit"))
 
-DT::datatable(check_dt)
+summary(mod0)
+
+# function to add latest fits to the data, removing any that exist
+joinModelDt <- function(mdt, mod_fits){
+  suppressWarnings(mdt[, (names(mod_fits)) := NULL])
+  return(cbind(mdt, mod_fits))
+}
+mod0_fits <- as.data.table(HH::interval(mod0, type = "response"))
+mdt <- joinModelDt(mdt, mod0_fits)
+
+# visualise the output
+ggplot(mdt, aes(x = bps, y = bonus_frac)) +
+  theme_minimal() + 
+  geom_jitter(width = 0.25, height= 0.025, col = "darkgrey") +
+  geom_ribbon(aes(x = bps, ymin = pi.low, ymax = pi.hi), fill = "orange", colour=NA, alpha = .3) + 
+  geom_line(aes(x = bps, y = fit)) + 
+  coord_cartesian(xlim = c(ql, qu))
+
 ```
+I'm not sure about the prediction intervals from the package `HH`, but this is a 
+different topic, not of focus in this post. It looks like it under predicts cases
+where `bonus = 3`. There isn't a clear single relationship for bps v bonus. This
+makes sense as each fixture differs e.g. number of goals, clean sheets etc.
+
+#### Playing Team
+Lets add in random slope and intercept parameters by team. A team that generally
+scores more `bps` values, like Man City, will require a higher threshold to receive
+bonus points. A low scoring team may require fewer points for a player to out rank
+the others in their team e.g. West Brom.
+
+```{r}
+# same slope, but varying intercept
+mod1 <- glm(bonus_frac ~ bps + team, data = mdt, family = quasibinomial("logit"))
+summary(mod1)
+anova(mod0, mod1, test = "Chisq")
+
+mod1_fits <- as.data.table(HH::interval(mod1, type = "response"))
+mdt <- joinModelDt(mdt, mod1_fits)
+
+# view for 2 of the teams
+ggplot(mdt[team %in% c("Arsenal", "Burnley"),], aes(x = bps, y = bonus_frac, col = team)) +
+  theme_minimal() + 
+  geom_jitter(width = 0.25, height= 0.025) +
+  geom_ribbon(aes(x = bps, ymin = pi.low, ymax = pi.hi, fill = team), colour=NA, alpha = .3) + 
+  geom_line(aes(x = bps, y = fit)) + 
+  coord_cartesian(xlim = c(ql, qu))
+```
+
+Can see there are significant effects for a varying intersect by team.
+A positive change in a team coefficient is interpreted to mean that for the 
+same bps value, the probability of receiving bonus points increases. What's interesting
+about comparing Arsenal to Burnley is that they finished in positions 6 and 7 respectively,
+yet have constrasting data. Arsenal scored 74 and conceded 51 goals whilst Burnley 
+scored 36 and conceded 39. Therefore, Burnley were involved in a lot more low goal scoring
+matches. As we've seen, this would lower the amount of bps on average, thus lowering
+the amount required to receive bonus points.  
+
+Added a chi-squared test to see if its significant in reduction of residual variance,
+which it is. Lets add in a random slope:
+
+
+```{r}
+# random slope and intercept
+mod2 <- glm(bonus_frac ~ bps*team, data = mdt, family = quasibinomial("logit"))
+summary(mod2)
+anova(mod1, mod2, test = "Chisq")
+
+# significant, so will re-assign mod1
+mod1 <- mod2
+mod2 <- NULL
+
+# extract p values and coefficients. plot deviation from main team: "Arsenal"
+find_i <- grepl("(?<!:)team", names(coef(mod1)), perl = TRUE)
+i_coefs <- coef(mod1)[find_i]
+i_pvals <- coef(summary(mod1))[,4][find_i] 
+find_s <- grepl("(?<=:)team", names(coef(mod1)), perl = TRUE)
+s_coefs <- coef(mod1)[find_s]
+s_pvals <- coef(summary(mod1))[,4][find_s] 
+team_coefs <- data.table(team = gsub("team", "", names(i_coefs)),
+                         intercept = i_coefs,
+                         slope = s_coefs,
+                         pval_i = i_pvals,
+                         pval_s = s_pvals)
+team_coefs[]
+
+# see how slope and intercept change, by team. Not all are significant
+ggplot(team_coefs, aes(x = intercept, y = slope, label = team)) + 
+  geom_text_repel() + 
+  theme_minimal() + 
+  geom_vline(xintercept = 0) + 
+  geom_hline(yintercept = 0)
+
+mod1_fits <- as.data.table(HH::interval(mod1, type = "response"))
+mdt <- joinModelDt(mdt, mod1_fits)
+
+# view for 2 of the teams
+ggplot(mdt[team %in% c("Arsenal", "Burnley"),], aes(x = bps, y = bonus_frac, col = team)) +
+  theme_minimal() + 
+  geom_jitter(width = 0.25, height= 0.025) +
+  geom_ribbon(aes(x = bps, ymin = pi.low, ymax = pi.hi, fill = team), colour=NA, alpha = .3) + 
+  geom_line(aes(x = bps, y = fit)) + 
+  coord_cartesian(xlim = c(ql, qu))
+```
+
+Arsenal is the baseline here. A positive change in the slope parameter means that
+the gradient of the slope is much steeper. For each value change in bps, 
+our probability of receiving bonus points increases.
+
+Man Utd and West Brom points on the intercept v slope change graph are the most
+unusual, due to their overall league performance.
+
+```{r}
+ggplot(mdt[team %in% c("West Brom", "Man Utd"),], aes(x = bps, y = bonus_frac, col = team)) +
+  theme_minimal() + 
+  geom_jitter(width = 0.25, height= 0.025) +
+  geom_ribbon(aes(x = bps, ymin = pi.low, ymax = pi.hi, fill = team), colour=NA, alpha = .3) + 
+  geom_line(aes(x = bps, y = fit)) + 
+  coord_cartesian(xlim = c(ql, qu))
+```
+
+
+Overall impact, by team
+```{r, fig.height = 12}
+mod1_fits <- as.data.table(HH::interval(mod1, type = "response"))
+mdt <- joinModelDt(mdt, mod1_fits)
+
+ggplot(mdt, aes(x = bps, y = bonus_frac)) +
+  theme_minimal() + 
+  geom_jitter(width = 0.25, height= 0.025, col = "darkgrey") +
+  geom_ribbon(aes(x = bps, ymin = pi.low, ymax = pi.hi), fill = "orange", colour=NA, alpha = .3) + 
+  geom_line(aes(x = bps, y = fit)) + 
+  facet_wrap(~team, ncol = 4) + 
+  coord_cartesian(xlim = c(ql, qu))
+```
+
+#### Opposition Team
+Lets look at the opposing team now. Is the threshold lower depending on who you are playing?
+
+```{r}
+mod2 <- glm(bonus_frac ~ bps + opponent_team, 
+            data = mdt, family = quasibinomial("logit"))
+summary(mod2)
+anova(mod0, mod2, test = "Chisq")
+
+mod2_fits <- as.data.table(HH::interval(mod2, type = "response"))
+mdt <- joinModelDt(mdt, mod2_fits)
+
+select_teams <- c("Man City", "Burnley")
+smdt <- mdt[opponent_team %in% select_teams,]
+
+ggplot(smdt, aes(x = bps, y = bonus_frac, col = opponent_team)) +
+  theme_minimal() + 
+  geom_jitter(width = 0.25, height= 0.025) +
+  geom_ribbon(aes(x = bps, ymin = pi.low, ymax = pi.hi, fill = opponent_team), colour=NA, alpha = .2) + 
+  geom_line(aes(x = bps, y = fit)) + 
+  coord_cartesian(xlim = c(ql, qu))
+```
+
+There aren't many significant effects here. However, bear in mind that if the 
+main level changed from Arsenal to Burnley, there would be more significant effects,
+as the hypothesis is testing whether the intercept changes against the main level.
+
+In addition, there are much fewer observations for players who scored bonus points 
+against Man City because of how well they did (see below). This is verified with
+them possessing the lowest intercept estimate in the model.
+
+```{r}
+sum_dt <- dt[, .(bonus = sum(bonus)), by = team]
+  ggplot(sum_dt, aes(x = reorder(team, bonus), y = bonus)) +
+    geom_bar(stat = "identity", aes(y = bonus), fill = "orange") +
+    coord_flip() + 
+    theme_minimal() + 
+    ylab("Team") + 
+    xlab("Overall bonus points") 
+```
+
+#### Playing Position
+We can also look at the impact of position on bonus points. People in different
+positions may do well based on differing circumstance, and may correlate with 
+the performance of players in other positions. 
+
+We can check this by looking at whether certain positions score together (below).
+In this case I took all fixtures where Goalkeepers received a bonus point. The mosaic plots
+below show that when they score, defenders often score too, way more than for fixtures
+where Goalkeepers don't score.  
+
+```{r}
+gkp_fixtures <- dt[bonus > 0 & position == "GKP", fixture]
+fdt <- dt[fixture %in% gkp_fixtures & bonus > 0 & position != "GKP",]
+odt <- dt[!fixture %in% gkp_fixtures & bonus > 0,]
+plot(table(fdt$position, fdt$bonus), main = "bonus distribution (GKP receives bonus)",
+     col = "cadetblue1")
+plot(table(odt$position, odt$bonus), main = "bonus distribution (GKP doesn't receives bonus)",
+     col = "orange")
+```
+
+Lets look at how position affects our base model:
+
+```{r}
+mod3 <- glm(bonus_frac ~ bps*position, 
+            data = mdt, family = quasibinomial("logit"))
+summary(mod3)
+# compare to base
+anova(mod0, mod3, test = "Chisq")
+
+mod3_fits <- as.data.table(HH::interval(mod3, type = "response"))
+mdt <- joinModelDt(mdt, mod3_fits)
+
+ggplot(mdt, aes(x = bps, y = bonus_frac)) +
+  theme_minimal() + 
+  geom_ribbon(aes(x = bps, ymin = pi.low, ymax = pi.hi, fill = position), colour=NA, alpha = .2) + 
+  geom_line(aes(x = bps, y = fit, col = position)) + 
+  coord_cartesian(xlim = c(ql, qu)) 
+```
+
+All effects are significant, for both the slope and intercept. 
+
+When keepers do well the probability of receiving bonus points has a steeper inclination. Often when
+keepers do really well, they keep a clean sheet and make lots of saves. If a team
+dominates a match, it increases likelihood of a clean sheet, but reduces the number of saves required.
+Therefore, we would presume if a keeper has a clean sheet and lots of saves, then
+the attacking side of the team has not been brilliant, increasing the bonus points chances.
+
+
+#### Final Model
+Bringing it all together in to one model:
+```{r}
+mod4 <- glm(bonus_frac ~ bps*position + bps*team + opponent_team, 
+            data = mdt, family = quasibinomial("logit"))
+summary(mod4)
+
+# performance is a lot better than for the base model with only bps slope.
+anova(mod0, mod4, test = "Chisq")
+
+# performance isn't too much better than mod1, with the team effects.
+# Parsimony could be measured by looking at a statistic that penalises model 
+# complexity e.g. AIC.
+anova(mod1, mod4, test = "Chisq")
+
+# predict with main data
+mod4_fits <- as.data.table(HH::interval(mod4, type = "response", newdata = dt))
+dt <- joinModelDt(dt, mod4_fits)
+dt[bps <= ql, fit := 0]
+
+# residuals top and bottom
+sum_dt <- dt[, .(bonus = sum(bonus),
+                 fit = round(sum(fit*3), 1),
+                 bps = sum(bps)), by = .(team, position, player_name)]
+sum_dt[, residual := bonus - fit]
+setorder(sum_dt, +residual)
+head(sum_dt)
+tail(sum_dt)
+
+# plot the fits, by position, across the whole season
+ggplot(sum_dt, aes(x = bonus, y = fit)) + 
+geom_point(col = "darkgrey") + 
+geom_abline(slope = 1, intercept = 0) + 
+theme_minimal() + 
+facet_wrap(~position)
+```
+
+
+## Final Thoughts
+
+In this post I've been practicing visualising patterns in the fpl bonus point data
+for different teams and positions. Logistic regression for a quasibinomial distribution
+was used to generate the predictions and analyse different variables. 
+
+An extension of this would be to try to focus on the interaction between players 
+within their own teams, by creating new variables e.g. we saw that Goalkeepers and
+Defenders often score together. The effect of playing at Home could be added to the analysis too.
+
+It may be possible to cluster fixtures together based on the score, and treat this 
+as a categorical variable in the model. I strayed away from using any data that 
+would interact with the bps variable though, as its dependent on the number of 
+goals scored. 
+
+I haven't focussed in on specific players during this, and there are other 
+interesting views that could be explored e.g. player form, and patterns in 
+transfer behaviour.
+
+We have the core data that make up the bps final score. It would be more 
+complicated to do so, but we could model the individual event distributions e.g.
+probability of scoring a goal, and try to predict these events to estimate bps 
+for future fixtures. We would run in to situations with sparse data e.g. there
+are only 17 red cards in the data set.

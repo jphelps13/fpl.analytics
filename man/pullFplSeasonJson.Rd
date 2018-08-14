@@ -2,30 +2,8 @@
 % Please edit documentation in R/data_extracts.R
 \name{pullFplSeasonJson}
 \alias{pullFplSeasonJson}
-\title{FUNCTION_TITLE}
+\title{pullFplSeasonJson}
 \usage{
 
   pullFplSeasonJson(url = "https://fantasy.premierleague.com/drf/bootstrap-static")
-}
-\arguments{
-\item{url}{PARAM_DESCRIPTION, Default: 'https://fantasy.premierleague.com/drf/bootstrap-static'}
-}
-\value{
-OUTPUT_DESCRIPTION
-}
-\description{
-FUNCTION_DESCRIPTION
-}
-\details{
-DETAILS
-}
-\examples{
-\dontrun{
-if(interactive()){
- #EXAMPLE1
- }
-}
-}
-\seealso{
-\code{\link[jsonlite]{fromJSON}}
 }

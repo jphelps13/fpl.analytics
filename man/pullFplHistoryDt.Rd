@@ -2,32 +2,8 @@
 % Please edit documentation in R/data_extracts.R
 \name{pullFplHistoryDt}
 \alias{pullFplHistoryDt}
-\title{FUNCTION_TITLE}
+\title{pullFplHistoryDt}
 \usage{
 pullFplHistoryDt(fpl_season_json,
   url = "https://fantasy.premierleague.com/drf/element-summary")
-}
-\arguments{
-\item{fpl_season_json}{PARAM_DESCRIPTION}
-
-\item{url}{PARAM_DESCRIPTION, Default: 'https://fantasy.premierleague.com/drf/element-summary'}
-}
-\value{
-OUTPUT_DESCRIPTION
-}
-\description{
-FUNCTION_DESCRIPTION
-}
-\details{
-DETAILS
-}
-\examples{
-\dontrun{
-if(interactive()){
- #EXAMPLE1
- }
-}
-}
-\seealso{
-\code{\link[jsonlite]{fromJSON}}
 }
